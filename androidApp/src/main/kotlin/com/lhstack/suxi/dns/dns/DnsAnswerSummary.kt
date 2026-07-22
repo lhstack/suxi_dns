@@ -157,12 +157,9 @@ private fun unsignedShort(bytes: ByteArray, offset: Int): Int {
 }
 
 private const val DNS_HEADER_SIZE = 12
-private const val TYPE_A = 1
 private const val TYPE_NS = 2
-private const val TYPE_CNAME = 5
 private const val TYPE_SOA = 6
 private const val TYPE_PTR = 12
 private const val TYPE_MX = 15
 private const val TYPE_TXT = 16
-private const val TYPE_AAAA = 28
 private const val TYPE_SRV = 33

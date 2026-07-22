@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-这是一个 Android DNS VPN 应用（项目名 `suxi_dns`，包名 `com.lhstack.suxi.dns`，展示名「速析 DNS」）。用户可以配置多个上游 DNS 端点，支持 UDP、HTTP、HTTPS 和 HTTP/3。启动后由 Android `VpnService` 接收发往虚拟 DNS 地址的 IPv4 UDP/53 请求，并发查询启用的上游端点，返回第一个通过 DNS 报文校验的响应。
+这是一个 Android DNS VPN 应用（项目名 `suxi_dns`，包名 `com.lhstack.suxi.dns`，展示名「速析 DNS」，当前版本 `1.0.1`）。用户可以配置多个上游 DNS 端点，支持 UDP、HTTP、HTTPS 和 HTTP/3；支持自定义解析与域名拦截。启动后由 Android `VpnService` 接收发往虚拟 DNS 地址的 IPv4 UDP/53 请求，按「拦截 → 本地解析 → 上游竞速」处理查询。
 
 当前实现边界：只处理 IPv4 UDP DNS 请求；IPv6、TCP/53、应用级 DNS over TLS/HTTPS 流量尚未接入。上游端点的 `host` 需要能在当前网络中解析；如果 VPN 已启动且网络环境无法提供该解析，应配置 IP 地址，或后续增加明确的 bootstrap 地址配置，不能静默回退到系统 DNS。
 
@@ -76,12 +76,16 @@
 
 ## UI 结构
 
-- 左上角菜单在「首页」与「DNS 服务器」之间切换。
+- 左上角菜单：首页、DNS 服务器、自定义解析、域名拦截。
 - 首页：VPN 启停与进程内内存日志（解析 / VPN / 异常），进程退出后丢弃，不落盘。
 - DNS 服务器：多上游列表，可分别启用/禁用、添加、删除；VPN 运行中只读。
+- 自定义解析：本地 A/AAAA/CNAME 记录，支持 `*` 通配与 TTL；持久化 `local_dns_records.json`。
+- 域名拦截：通配符或正则规则，命中返回 NXDOMAIN；持久化 `domain_block_rules.json`。
+- 查询顺序：拦截 → 本地解析 → 上游竞速。
 - 上游配置持久化到应用私有目录 `dns_servers.json`；启动时加载到内存，增删改立即写回。
 - 多上游并行竞速：取第一个通过校验的成功响应，其余取消。
 - DoQ/QUIC 已移除；历史配置中的 QUIC 项在加载时会被剔除。
+- VPN 停止时须对读包/写包协程做停止标志与异常吞没，避免关闭后写 TUN 导致闪退。
 
 ## 当前未确认事项
 

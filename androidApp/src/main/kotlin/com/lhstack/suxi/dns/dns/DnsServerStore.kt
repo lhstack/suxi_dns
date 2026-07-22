@@ -1,24 +1,22 @@
 package com.lhstack.suxi.dns.dns
 
 import android.content.Context
-import com.lhstack.suxi.dns.model.DnsProtocol
 import com.lhstack.suxi.dns.model.DnsServerConfig
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.io.File
 
 /**
  * DNS 上游配置持久化。
- * 磁盘 JSON + 调用方内存 StateFlow；启动时读入，增删改后写回。
+ * 首次文件由 [DnsServersInitializer] 在 Application 启动时写入；
+ * 本类只负责读已有文件与写回。
  */
 class DnsServerStore(context: Context) {
-    private val file = File(context.applicationContext.filesDir, FILE_NAME)
+    private val appContext = context.applicationContext
+    private val file = File(appContext.filesDir, DnsServersInitializer.LOCAL_FILE_NAME)
     private val json = Json {
         prettyPrint = true
         ignoreUnknownKeys = true
@@ -26,15 +24,13 @@ class DnsServerStore(context: Context) {
     }
 
     fun load(): List<DnsServerConfig> {
-        if (!file.exists()) {
-            val defaults = defaultServers()
-            save(defaults)
-            return defaults
-        }
+        // 双保险：若 Application 尚未初始化，补一次（不覆盖已有文件）
+        DnsServersInitializer.ensureInitialized(appContext)
+        if (!file.exists()) return emptyList()
         return try {
             val text = file.readText()
             if (text.isBlank()) {
-                defaultServers().also(::save)
+                emptyList()
             } else {
                 val migrated = dropRemovedProtocols(text)
                 val servers = json.decodeFromString(
@@ -44,17 +40,17 @@ class DnsServerStore(context: Context) {
                 if (migrated != text) {
                     save(servers)
                 }
-                servers.ifEmpty { defaultServers().also(::save) }
+                servers
             }
         } catch (exception: Exception) {
-            AppLog.error("读取 DNS 配置失败，使用默认配置: ${exception.message}")
-            defaultServers().also(::save)
+            AppLog.error("读取 DNS 配置失败: ${exception.message}")
+            emptyList()
         }
     }
 
     fun save(servers: List<DnsServerConfig>) {
         val text = json.encodeToString(ListSerializer(DnsServerConfig.serializer()), servers)
-        val temp = File(file.parentFile, "$FILE_NAME.tmp")
+        val temp = File(file.parentFile, "${file.name}.tmp")
         temp.writeText(text)
         if (!temp.renameTo(file)) {
             file.writeText(text)
@@ -77,16 +73,6 @@ class DnsServerStore(context: Context) {
     }
 
     companion object {
-        private const val FILE_NAME = "dns_servers.json"
         private val REMOVED_PROTOCOLS = setOf("QUIC")
-
-        fun defaultServers(): List<DnsServerConfig> = listOf(
-            DnsServerConfig(
-                id = 1,
-                protocol = DnsProtocol.UDP,
-                host = "223.5.5.5",
-                port = DnsProtocol.UDP.defaultPort,
-            ),
-        )
     }
 }

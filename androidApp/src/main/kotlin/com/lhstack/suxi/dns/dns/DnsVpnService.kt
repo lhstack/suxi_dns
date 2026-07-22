@@ -11,6 +11,9 @@ import android.os.ParcelFileDescriptor
 import com.lhstack.suxi.dns.MainActivity
 import com.lhstack.suxi.dns.dns.resolver.CompositeResolver
 import com.lhstack.suxi.dns.model.DnsServerConfig
+import com.lhstack.suxi.dns.model.DomainBlockRule
+import com.lhstack.suxi.dns.model.LocalDnsRecord
+import com.lhstack.suxi.dns.model.LocalRecordType
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -22,6 +25,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.builtins.ListSerializer
@@ -29,12 +33,17 @@ import kotlinx.serialization.json.Json
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.InetAddress
+import java.util.concurrent.atomic.AtomicBoolean
 
 class DnsVpnService : VpnService() {
     private var vpnInterface: ParcelFileDescriptor? = null
     private var resolver: CompositeResolver? = null
     private var serviceScope: CoroutineScope? = null
     private val outputMutex = Mutex()
+    private val stopping = AtomicBoolean(false)
+    private var blockMatcher: DomainBlockMatcher = DomainBlockMatcher(emptyList())
+    private var localRecords: List<LocalDnsRecord> = emptyList()
+    private val localNameMatcher = LocalNameMatcher()
 
     override fun onCreate() {
         super.onCreate()
@@ -79,7 +88,17 @@ class DnsVpnService : VpnService() {
             require(configs.any(DnsServerConfig::enabled)) {
                 "至少需要启用一个 DNS 服务器"
             }
-            startVpn(configs)
+            val local = decodeListExtra(
+                intent,
+                EXTRA_LOCAL_RECORDS,
+                LocalDnsRecord.serializer(),
+            )
+            val blocks = decodeListExtra(
+                intent,
+                EXTRA_BLOCK_RULES,
+                DomainBlockRule.serializer(),
+            )
+            startVpn(configs, local, blocks)
         } catch (exception: Exception) {
             val message = exception.message ?: "无法启动 DNS VPN"
             AppLog.error(message)
@@ -88,14 +107,34 @@ class DnsVpnService : VpnService() {
         }
     }
 
-    private fun startVpn(configs: List<DnsServerConfig>) {
+    private fun <T> decodeListExtra(
+        intent: Intent,
+        key: String,
+        serializer: kotlinx.serialization.KSerializer<T>,
+    ): List<T> {
+        val encoded = intent.getStringExtra(key) ?: return emptyList()
+        return Json.decodeFromString(ListSerializer(serializer), encoded)
+    }
+
+    private fun startVpn(
+        configs: List<DnsServerConfig>,
+        local: List<LocalDnsRecord>,
+        blocks: List<DomainBlockRule>,
+    ) {
         closeResources()
+        stopping.set(false)
         AppLog.clear()
         val enabled = configs.filter(DnsServerConfig::enabled)
         AppLog.vpn("正在启动 DNS VPN，共 ${enabled.size} 个上游")
         enabled.forEach { config ->
             AppLog.info("上游: ${config.displayAddress}")
         }
+        localRecords = local.filter(LocalDnsRecord::enabled)
+        blockMatcher = DomainBlockMatcher(blocks)
+        AppLog.info(
+            "本地规则: ${localRecords.size} 条自定义解析, " +
+                "${blocks.count(DomainBlockRule::enabled)} 条拦截",
+        )
         publishStatus(VpnState.STARTING, "正在启动 DNS VPN")
         startForeground(NOTIFICATION_ID, createNotification())
 
@@ -132,16 +171,15 @@ class DnsVpnService : VpnService() {
         val input = FileInputStream(tunnel.fileDescriptor)
         val output = FileOutputStream(tunnel.fileDescriptor)
         val readBuffer = ByteArray(MAX_PACKET_SIZE)
-        // 限制并发解析，避免失败重试风暴拖垮前台服务。
-        val querySemaphore = kotlinx.coroutines.sync.Semaphore(MAX_IN_FLIGHT_QUERIES)
+        val querySemaphore = Semaphore(MAX_IN_FLIGHT_QUERIES)
         try {
-            while (currentCoroutineContext().isActive) {
+            while (currentCoroutineContext().isActive && !stopping.get()) {
                 val length = try {
                     withContext(Dispatchers.IO) {
                         input.read(readBuffer)
                     }
                 } catch (exception: Exception) {
-                    if (currentCoroutineContext().isActive) {
+                    if (currentCoroutineContext().isActive && !stopping.get()) {
                         AppLog.error("读取 VPN 报文失败: ${exception.message}")
                     }
                     break
@@ -156,19 +194,24 @@ class DnsVpnService : VpnService() {
                 scope.launch {
                     if (!querySemaphore.tryAcquire()) {
                         AppLog.error("并发查询过多，丢弃请求 ${extractDnsQueryName(dnsPacket.dnsMessage)}")
-                        writePacket(output, dnsPacket.createServFailResponse())
+                        writePacketSafely(output, dnsPacket.createServFailResponse())
                         return@launch
                     }
                     try {
                         handleDnsQuery(dnsPacket, output)
+                    } catch (exception: Exception) {
+                        if (!stopping.get()) {
+                            AppLog.error(
+                                "处理查询失败: ${exception.message ?: exception::class.simpleName}",
+                            )
+                        }
                     } finally {
                         querySemaphore.release()
                     }
                 }
             }
         } finally {
-            // 读包循环结束不自动 stopSelf：可能是短暂 I/O 异常；由用户/系统显式停止。
-            if (currentCoroutineContext().isActive) {
+            if (currentCoroutineContext().isActive && !stopping.get()) {
                 AppLog.vpn("读包循环结束，VPN 服务仍保持前台状态")
             }
         }
@@ -178,37 +221,142 @@ class DnsVpnService : VpnService() {
         dnsPacket: Ipv4UdpDnsPacket,
         output: FileOutputStream,
     ) {
-        val queryName = extractDnsQueryName(dnsPacket.dnsMessage)
+        if (stopping.get()) return
+        val query = dnsPacket.dnsMessage
+        val question = parseDnsQuestion(query)
+        val queryName = question?.name ?: extractDnsQueryName(query)
         AppLog.query("查询 $queryName")
         val startedAt = System.currentTimeMillis()
-        val resolution = try {
-            requireNotNull(resolver) { "DNS 解析器不可用" }
-                .resolve(dnsPacket.dnsMessage)
-        } catch (exception: Exception) {
-            val message = exception.message ?: "所有 DNS 上游均失败"
-            AppLog.error("$queryName: $message")
-            // 不要用长错误刷状态栏/通知，保持 RUNNING 短文案。
-            writePacket(output, dnsPacket.createServFailResponse())
+
+        // 1) 拦截规则：直接 NXDOMAIN
+        val blocked = blockMatcher.findMatch(queryName)
+        if (blocked != null) {
+            val response = buildDnsResponse(query, rcode = RCODE_NXDOMAIN)
+            AppLog.error(
+                "$queryName 已拦截 | 规则 ${blocked.displaySummary} | " +
+                    "${System.currentTimeMillis() - startedAt}ms",
+            )
+            writePacketSafely(output, dnsPacket.createResponse(response))
             return
         }
+
+        // 2) 本地自定义解析（A / AAAA / CNAME；对 A/AAAA 会跟随本地 CNAME）
+        if (question != null) {
+            val localResponse = resolveLocal(query, queryName, question.type)
+            if (localResponse != null) {
+                val elapsedMs = System.currentTimeMillis() - startedAt
+                val answers = summarizeDnsAnswers(localResponse)
+                AppLog.success(
+                    "$queryName → $answers | 本地规则 | ${elapsedMs}ms",
+                )
+                writePacketSafely(output, dnsPacket.createResponse(localResponse))
+                return
+            }
+        }
+
+        // 3) 上游竞速
+        val resolution = try {
+            requireNotNull(resolver) { "DNS 解析器不可用" }
+                .resolve(query)
+        } catch (exception: Exception) {
+            if (stopping.get()) return
+            val message = exception.message ?: "所有 DNS 上游均失败"
+            AppLog.error("$queryName: $message")
+            writePacketSafely(output, dnsPacket.createServFailResponse())
+            return
+        }
+        if (stopping.get()) return
         val elapsedMs = System.currentTimeMillis() - startedAt
         val answers = summarizeDnsAnswers(resolution.response)
         AppLog.success(
             "$queryName → $answers | 上游 ${resolution.upstream} | ${elapsedMs}ms | ${resolution.response.size}字节",
         )
-        writePacket(output, dnsPacket.createResponse(resolution.response))
+        writePacketSafely(output, dnsPacket.createResponse(resolution.response))
     }
 
-    private suspend fun writePacket(output: FileOutputStream, packet: ByteArray) {
-        outputMutex.withLock {
-            output.write(packet)
+    /**
+     * 本地解析。
+     * - A/AAAA/CNAME 类型直接命中对应记录则立即返回，不走上游。
+     * - 查询 A/AAAA 但只命中 CNAME：返回 CNAME，并尽量解析目标的 A/AAAA
+     *   （先本地，再仅对 CNAME 目标请求上游一次），减少客户端二次查询。
+     */
+    private suspend fun resolveLocal(
+        query: ByteArray,
+        queryName: String,
+        qtype: Int,
+    ): ByteArray? {
+        val hit = findLocalRecord(queryName, qtype) ?: return null
+        if (hit.type != LocalRecordType.CNAME || (qtype != TYPE_A && qtype != TYPE_AAAA)) {
+            return buildDnsResponse(query, answers = localRecordToAnswers(hit, queryName))
+        }
+
+        val answers = localRecordToAnswers(hit, queryName).toMutableList()
+        val target = normalizeDnsName(hit.value)
+        // 1) 目标是否也有本地 A/AAAA
+        val localTarget = findLocalRecordExact(target, qtype)
+        if (localTarget != null) {
+            answers += localRecordToAnswers(localTarget, target)
+            return buildDnsResponse(query, answers = answers)
+        }
+        // 2) 仅对 CNAME 目标向上游要一次 A/AAAA（不是对原域名再查）
+        val activeResolver = resolver ?: return buildDnsResponse(query, answers = answers)
+        return try {
+            val followQuery = buildDnsQuery(target, qtype, query[0], query[1])
+            val upstream = activeResolver.resolve(followQuery)
+            val followed = extractAnswerRecords(upstream.response)
+            if (followed.isNotEmpty()) {
+                answers += followed
+            }
+            buildDnsResponse(query, answers = answers)
+        } catch (_: Exception) {
+            // 跟随失败仍返回 CNAME，客户端可自行再查目标
+            buildDnsResponse(query, answers = answers)
+        }
+    }
+
+    private fun findLocalRecord(queryName: String, qtype: Int): LocalDnsRecord? {
+        val candidates = localRecords.filter { record ->
+            localNameMatcher.matches(record.name, queryName)
+        }
+        if (candidates.isEmpty()) return null
+        candidates.firstOrNull { it.type.wireType == qtype }?.let { return it }
+        if (qtype == TYPE_A || qtype == TYPE_AAAA) {
+            return candidates.firstOrNull { it.type == LocalRecordType.CNAME }
+        }
+        return null
+    }
+
+    private fun findLocalRecordExact(queryName: String, qtype: Int): LocalDnsRecord? {
+        return localRecords.firstOrNull { record ->
+            localNameMatcher.matches(record.name, queryName) && record.type.wireType == qtype
+        }
+    }
+
+    private suspend fun writePacketSafely(output: FileOutputStream, packet: ByteArray) {
+        if (stopping.get()) return
+        try {
+            outputMutex.withLock {
+                if (stopping.get()) return
+                output.write(packet)
+            }
+        } catch (exception: Exception) {
+            if (!stopping.get()) {
+                AppLog.error("写入 VPN 报文失败: ${exception.message}")
+            }
         }
     }
 
     private fun requestStop(reason: String = "手动停止") {
+        if (!stopping.compareAndSet(false, true) && _status.value.state == VpnState.STOPPED) {
+            return
+        }
         AppLog.vpn("正在停止 DNS VPN：$reason")
         closeResources()
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } catch (_: Exception) {
+            // 通知可能已移除
+        }
         stopSelf()
         if (_status.value.state != VpnState.ERROR) {
             AppLog.vpn("DNS VPN 已停止（$reason）")
@@ -219,9 +367,15 @@ class DnsVpnService : VpnService() {
     private fun closeResources() {
         serviceScope?.cancel()
         serviceScope = null
-        resolver?.close()
+        try {
+            resolver?.close()
+        } catch (_: Exception) {
+        }
         resolver = null
-        vpnInterface?.close()
+        try {
+            vpnInterface?.close()
+        } catch (_: Exception) {
+        }
         vpnInterface = null
     }
 
@@ -273,6 +427,8 @@ class DnsVpnService : VpnService() {
         const val ACTION_START = "com.lhstack.suxi.dns.action.START_VPN"
         const val ACTION_STOP = "com.lhstack.suxi.dns.action.STOP_VPN"
         const val EXTRA_CONFIGS = "dns_servers"
+        const val EXTRA_LOCAL_RECORDS = "local_records"
+        const val EXTRA_BLOCK_RULES = "block_rules"
 
         private const val VPN_ADDRESS = "10.10.10.1"
         private const val DNS_ADDRESS = "10.10.10.2"
