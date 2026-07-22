@@ -12,6 +12,8 @@
 
 > DNS VPN 能力目前仅 Android 实现。仓库仍保留 Kotlin Multiplatform / iOS 模板结构，但 iOS 侧没有同等 VPN 功能。
 
+![速析 DNS 界面演示](images/1.gif)
+
 ---
 
 ## 功能特性
