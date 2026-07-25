@@ -1,8 +1,10 @@
 package com.lhstack.suxi.dns.dns.resolver
 
+import android.content.Context
 import android.net.VpnService
 import com.lhstack.suxi.dns.model.DnsProtocol
 import com.lhstack.suxi.dns.model.DnsServerConfig
+import com.lhstack.suxi.dns.model.DnsServerGroup
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
@@ -15,22 +17,52 @@ data class UpstreamResolution(
     val response: ByteArray,
 )
 
+/**
+ * 按分组解析：
+ * - 组间按列表顺序 fallback，仅当前一组全部上游失败才尝试下一组。
+ * - 组内启用的上游并发竞速，取第一个通过校验的成功响应并取消其余请求。
+ * - 所有启用组均失败时抛出 [UpstreamResolutionException]。
+ *
+ * [context] 用于构建 Cronet（HTTP/3）engine。
+ * [vpnService] 为 null 时表示不在 VPN 通路内（如手动解析工具）：UDP 上游走普通 socket，
+ * 不做 protect；VPN 运行时必须传入，否则 UDP 上游查询会被虚拟 DNS 路由回环捕获。
+ */
 class CompositeResolver(
-    private val vpnService: VpnService,
-    configs: List<DnsServerConfig>,
+    private val context: Context,
+    private val vpnService: VpnService?,
+    groups: List<DnsServerGroup>,
 ) : Closeable {
     private val httpClient = HttpDnsResolver.createClient()
     private val cronetExecutor: ExecutorService = Executors.newCachedThreadPool()
     private val http3Resolvers = mutableListOf<Http3DnsResolver>()
-    private val resolvers = configs.filter(DnsServerConfig::enabled).map(::createResolver)
+    private val resolverGroups = groups
+        .filter(DnsServerGroup::enabled)
+        .map { group -> group.enabledServers.map(::createResolver) }
+        .filter { it.isNotEmpty() }
 
     init {
-        require(resolvers.isNotEmpty()) { "至少需要启用一个 DNS 上游服务器" }
+        require(resolverGroups.isNotEmpty()) { "至少需要启用一个含有效上游的 DNS 分组" }
     }
 
-    suspend fun resolve(query: ByteArray): UpstreamResolution = coroutineScope {
-        val results = Channel<Result<UpstreamResolution>>(resolvers.size)
-        val requests = resolvers.map { resolver ->
+    suspend fun resolve(query: ByteArray): UpstreamResolution {
+        val failures = mutableListOf<Throwable>()
+        for (group in resolverGroups) {
+            try {
+                return raceGroup(group, query)
+            } catch (exception: UpstreamResolutionException) {
+                failures += exception.suppressedExceptions.ifEmpty { listOf(exception) }
+            }
+        }
+        throw UpstreamResolutionException(failures)
+    }
+
+    /** 组内并发竞速：第一个成功立即返回，其余取消。 */
+    private suspend fun raceGroup(
+        group: List<DnsResolver>,
+        query: ByteArray,
+    ): UpstreamResolution = coroutineScope {
+        val results = Channel<Result<UpstreamResolution>>(group.size)
+        val requests = group.map { resolver ->
             async {
                 results.send(
                     runCatching {
@@ -46,7 +78,7 @@ class CompositeResolver(
         }
         val failures = mutableListOf<Throwable>()
         try {
-            repeat(resolvers.size) {
+            repeat(group.size) {
                 val result = results.receive()
                 result.onSuccess { return@coroutineScope it }
                 result.exceptionOrNull()?.let(failures::add)
@@ -84,7 +116,7 @@ class CompositeResolver(
                 config.path,
             )
             DnsProtocol.HTTP3 -> Http3DnsResolver(
-                vpnService,
+                context,
                 cronetExecutor,
                 config.host,
                 config.port,

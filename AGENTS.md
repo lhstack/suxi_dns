@@ -2,9 +2,9 @@
 
 ## 项目概述
 
-这是一个 Android DNS VPN 应用（项目名 `suxi_dns`，包名 `com.lhstack.suxi.dns`，展示名「速析 DNS」，当前版本 `1.0.1`）。用户可以配置多个上游 DNS 端点，支持 UDP、HTTP、HTTPS 和 HTTP/3；支持自定义解析与域名拦截。启动后由 Android `VpnService` 接收发往虚拟 DNS 地址的 IPv4 UDP/53 请求，按「拦截 → 本地解析 → 上游竞速」处理查询。
+这是一个 Android DNS VPN 应用（项目名 `suxi_dns`，包名 `com.lhstack.suxi.dns`，展示名「速析 DNS」，当前版本 `1.0.1`）。用户可以配置多个上游 DNS 端点，支持 UDP、HTTP、HTTPS 和 HTTP/3；支持自定义解析与域名拦截。上游按**分组**组织：组内启用上游并发竞速取最快，组间按列表顺序 fallback（当前组全部失败才尝试下一组）。启动后由 Android `VpnService` 接收发往虚拟 DNS 地址的 IPv4 UDP/53 请求，按「拦截 → 本地解析 → DNS 缓存 → 上游分组 fallback」处理查询。
 
-当前实现边界：只处理 IPv4 UDP DNS 请求；IPv6、TCP/53、应用级 DNS over TLS/HTTPS 流量尚未接入。上游端点的 `host` 需要能在当前网络中解析；如果 VPN 已启动且网络环境无法提供该解析，应配置 IP 地址，或后续增加明确的 bootstrap 地址配置，不能静默回退到系统 DNS。
+当前实现边界：只处理 IPv4 UDP DNS 请求；IPv6、TCP/53 尚未接入。DNS 缓存为进程内、按 TTL 过期、不落盘。上游端点的 `host` 需要能在当前网络中解析；如果 VPN 已启动且网络环境无法提供该解析，应配置 IP 地址，或后续增加明确的 bootstrap 地址配置，不能静默回退到系统 DNS。
 
 ## 工程环境与主要工具
 
@@ -29,7 +29,10 @@
 - `ui/DnsConfigViewModel.kt`: 配置校验、序列化和服务控制
 - `dns/DnsVpnService.kt`: TUN 生命周期、前台通知和 DNS 请求处理
 - `dns/Ipv4UdpDnsPacket.kt`: IPv4/UDP/DNS 报文解析、响应封装和 SERVFAIL
-- `dns/resolver/CompositeResolver.kt`: 首个成功上游竞速并取消其他请求
+- `dns/resolver/CompositeResolver.kt`: 按分组 fallback，组内并发竞速取首个成功响应并取消其余请求
+- `dns/DnsResponseCache.kt`: 进程内 DNS 响应缓存，按「域名 + 查询类型」缓存，按答案区最小 TTL 过期，不缓存 SERVFAIL
+- `dns/DnsServerStore.kt`: 分组配置持久化，兼容旧扁平数组并自动迁移为单分组
+- `dns/DnsServersInitializer.kt`: 首次启动写入默认两个分组（首选 UDP 并发 / 备用 HTTP/3 fallback）
 - `dns/resolver/UdpDnsResolver.kt`: UDP DNS
 - `dns/resolver/HttpDnsResolver.kt`: HTTP/HTTPS `application/dns-message`
 - `dns/resolver/Doh3Resolver.kt`: Cronet QUIC + HTTP/3，要求协商协议确实为 h3，不降级
@@ -44,19 +47,20 @@
 
 ## 业务流程与契约
 
-1. 用户至少启用一个完整且合法的上游配置。
+1. 用户至少启用一个含有效上游的分组（启用的分组必须至少有一个启用且合法的上游）。
 2. 点击启动时先调用 `VpnService.prepare`；未授权时必须启动系统授权 Activity。
 3. 授权成功后启动前台 `DnsVpnService`。
 4. VPN 仅接收发往虚拟 DNS 地址的 IPv4 UDP/53。
-5. 每个请求并发发送到所有启用上游；第一个通过事务 ID和响应标志校验的 DNS 响应立即返回。
-6. 所有上游失败时返回对应请求的 SERVFAIL，不伪造成功数据。
-7. 停止、撤销权限或启动失败时关闭 TUN、取消协程并释放网络资源。
+5. 每个请求先查拦截规则与本地解析，再查 DNS 缓存；未命中才走上游。
+6. 上游按分组顺序 fallback：组内所有启用上游并发发送，第一个通过事务 ID 和响应标志校验的响应立即返回；当前组全部失败才尝试下一组。
+7. 上游成功（NOERROR/NXDOMAIN）的响应按 TTL 写入缓存；所有分组失败时返回 SERVFAIL，不伪造成功数据。
+8. 停止、撤销权限或启动失败时关闭 TUN、取消协程并释放网络资源。
 
 ## 错误处理约定
 
 - 配置错误在 ViewModel/Service 边界显式报错。
-- 单个上游失败只作为竞速失败，不阻止其他上游。
-- 所有上游失败必须保留失败原因并返回 SERVFAIL；不得返回空响应、默认解析结果或静默降级。
+- 单个上游失败只作为组内竞速失败，不阻止同组其他上游，也不阻止 fallback 到下一组。
+- 所有分组全部失败必须保留失败原因并返回 SERVFAIL；不得返回空响应、默认解析结果或静默降级。
 - HTTP/3 必须验证 Cronet 协商结果为 h3/quic；不能把 HTTP/2 当作 HTTP/3。
 
 ## 构建、测试和验证
@@ -72,24 +76,24 @@
 - Kotlin 官方格式，配置和传输对象使用不可变 `data class`。
 - 网络 I/O 放在 `Dispatchers.IO` 或网络库回调中。
 - 方法按高层流程组织，协议细节下沉到对应 resolver/报文类。
-- 不添加未确认业务需求的缓存、fallback、协议别名或兼容分支。
+- 分组 fallback 与 DNS 缓存是已确认的业务需求；除此之外不添加未确认的降级、协议别名或兼容分支。
 
 ## UI 结构
 
 - 左上角菜单：首页、DNS 服务器、自定义解析、域名拦截。
 - 首页：VPN 启停与进程内内存日志（解析 / VPN / 异常），进程退出后丢弃，不落盘。
-- DNS 服务器：多上游列表，可分别启用/禁用、添加、删除；VPN 运行中只读。
+- DNS 服务器：分组列表。每个分组可命名、整体启停、组内增删改上游；组左侧手柄长按可拖拽调整组的 fallback 顺序；VPN 运行中只读。
 - 自定义解析：本地 A/AAAA/CNAME 记录，支持 `*` 通配与 TTL；持久化 `local_dns_records.json`。
 - 域名拦截：通配符或正则规则，命中返回 NXDOMAIN；持久化 `domain_block_rules.json`。
-- 查询顺序：拦截 → 本地解析 → 上游竞速。
-- 上游配置持久化到应用私有目录 `dns_servers.json`；启动时加载到内存，增删改立即写回。
-- 多上游并行竞速：取第一个通过校验的成功响应，其余取消。
+- 查询顺序：拦截 → 本地解析 → DNS 缓存 → 上游分组 fallback。
+- 分组配置持久化到应用私有目录 `dns_servers.json`（数组）；启动时加载到内存，增删改立即写回；旧版扁平上游数组在加载时自动迁移为单个分组。
+- 分组 fallback + 组内并发竞速：组内取第一个通过校验的成功响应其余取消，组全失败才 fallback 下一组。
 - DoQ/QUIC 已移除；历史配置中的 QUIC 项在加载时会被剔除。
 - VPN 停止时须对读包/写包协程做停止标志与异常吞没，避免关闭后写 TUN 导致闪退。
 
 ## 当前未确认事项
 
 - iOS 是否需要同等 VPN/DNS 能力；当前没有实现。
-- 是否需要 IPv6、TCP DNS、持久化配置、DNS 缓存、DNSSEC 校验、证书 pinning。
+- 是否需要 IPv6、TCP DNS、DNSSEC 校验、证书 pinning。（DNS 缓存已实现：进程内、按 TTL 过期、不落盘。）
 - 上游 hostname 的 bootstrap 解析地址配置。
 - 当前目录没有可用于确认的版本控制元数据和历史提交记录。

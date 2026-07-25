@@ -10,7 +10,7 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import com.lhstack.suxi.dns.MainActivity
 import com.lhstack.suxi.dns.dns.resolver.CompositeResolver
-import com.lhstack.suxi.dns.model.DnsServerConfig
+import com.lhstack.suxi.dns.model.DnsServerGroup
 import com.lhstack.suxi.dns.model.DomainBlockRule
 import com.lhstack.suxi.dns.model.LocalDnsRecord
 import com.lhstack.suxi.dns.model.LocalRecordType
@@ -44,6 +44,7 @@ class DnsVpnService : VpnService() {
     private var blockMatcher: DomainBlockMatcher = DomainBlockMatcher(emptyList())
     private var localRecords: List<LocalDnsRecord> = emptyList()
     private val localNameMatcher = LocalNameMatcher()
+    private val responseCache = DnsResponseCache()
 
     override fun onCreate() {
         super.onCreate()
@@ -80,13 +81,13 @@ class DnsVpnService : VpnService() {
             val encodedConfigs = requireNotNull(intent.getStringExtra(EXTRA_CONFIGS)) {
                 "缺少 DNS 服务器配置"
             }
-            val configs = Json.decodeFromString(
-                ListSerializer(DnsServerConfig.serializer()),
+            val groups = Json.decodeFromString(
+                ListSerializer(DnsServerGroup.serializer()),
                 encodedConfigs,
             )
-            configs.filter(DnsServerConfig::enabled).forEach(DnsServerConfig::validate)
-            require(configs.any(DnsServerConfig::enabled)) {
-                "至少需要启用一个 DNS 服务器"
+            groups.filter(DnsServerGroup::enabled).forEach(DnsServerGroup::validate)
+            require(groups.any { it.enabled && it.enabledServers.isNotEmpty() }) {
+                "至少需要启用一个含有效上游的 DNS 分组"
             }
             val local = decodeListExtra(
                 intent,
@@ -98,7 +99,7 @@ class DnsVpnService : VpnService() {
                 EXTRA_BLOCK_RULES,
                 DomainBlockRule.serializer(),
             )
-            startVpn(configs, local, blocks)
+            startVpn(groups, local, blocks)
         } catch (exception: Exception) {
             val message = exception.message ?: "无法启动 DNS VPN"
             AppLog.error(message)
@@ -117,17 +118,19 @@ class DnsVpnService : VpnService() {
     }
 
     private fun startVpn(
-        configs: List<DnsServerConfig>,
+        groups: List<DnsServerGroup>,
         local: List<LocalDnsRecord>,
         blocks: List<DomainBlockRule>,
     ) {
         closeResources()
         stopping.set(false)
         AppLog.clear()
-        val enabled = configs.filter(DnsServerConfig::enabled)
-        AppLog.vpn("正在启动 DNS VPN，共 ${enabled.size} 个上游")
-        enabled.forEach { config ->
-            AppLog.info("上游: ${config.displayAddress}")
+        responseCache.clear()
+        val enabledGroups = groups.filter { it.enabled && it.enabledServers.isNotEmpty() }
+        AppLog.vpn("正在启动 DNS VPN，共 ${enabledGroups.size} 个分组")
+        enabledGroups.forEachIndexed { index, group ->
+            val upstreams = group.enabledServers.joinToString(", ") { it.displayAddress }
+            AppLog.info("分组 ${index + 1}「${group.displayName}」: $upstreams")
         }
         localRecords = local.filter(LocalDnsRecord::enabled)
         blockMatcher = DomainBlockMatcher(blocks)
@@ -148,7 +151,7 @@ class DnsVpnService : VpnService() {
                 .establish()
                 ?: error("系统无法建立 VPN 接口")
 
-            val establishedResolver = CompositeResolver(this, configs)
+            val establishedResolver = CompositeResolver(this, this, enabledGroups)
             vpnInterface = establishedInterface
             resolver = establishedResolver
             serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO).also { scope ->
@@ -254,7 +257,20 @@ class DnsVpnService : VpnService() {
             }
         }
 
-        // 3) 上游竞速
+        // 3) 缓存命中：直接返回，不走上游（改写事务 ID 以匹配当前查询）
+        if (question != null) {
+            val cached = responseCache.get(queryName, question.type)
+            if (cached != null) {
+                val response = rewriteDnsResponseId(cached, query)
+                val elapsedMs = System.currentTimeMillis() - startedAt
+                val answers = summarizeDnsAnswers(response)
+                AppLog.success("$queryName → $answers | 缓存 | ${elapsedMs}ms")
+                writePacketSafely(output, dnsPacket.createResponse(response))
+                return
+            }
+        }
+
+        // 4) 上游竞速
         val resolution = try {
             requireNotNull(resolver) { "DNS 解析器不可用" }
                 .resolve(query)
@@ -266,6 +282,10 @@ class DnsVpnService : VpnService() {
             return
         }
         if (stopping.get()) return
+        // 写入缓存：仅对可解析出问题段的成功/NXDOMAIN 响应缓存
+        if (question != null) {
+            responseCache.put(queryName, question.type, resolution.response)
+        }
         val elapsedMs = System.currentTimeMillis() - startedAt
         val answers = summarizeDnsAnswers(resolution.response)
         AppLog.success(
