@@ -14,6 +14,7 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -24,9 +25,23 @@ class Http3DnsResolver(
     private val port: Int,
     private val path: String,
 ) : DnsResolver {
+    private val appContext = context.applicationContext
     private val endpoint = resolveTlsEndpoint(host)
 
-    private val engine: CronetEngine = buildEngine(context)
+    // 懒加载 + 空闲回收：只有真正发生 HTTP/3 查询时才建 Cronet engine；
+    // 建成后若长时间无查询，由外部（CompositeResolver）调用 recycleIfIdle 关闭并重置，
+    // 下次查询再重建。避免 QUIC engine 建成后常驻后台、空闲维持连接耗电。
+    private val engineLock = Any()
+    private var engine: CronetEngine? = null
+    private val lastUsedAtMs = AtomicLong(0L)
+
+    /** 取用中的 engine：不存在则创建，并刷新最后使用时间。 */
+    private fun acquireEngine(): CronetEngine {
+        lastUsedAtMs.set(System.currentTimeMillis())
+        synchronized(engineLock) {
+            return engine ?: buildEngine(appContext).also { engine = it }
+        }
+    }
 
     override val description: String = if (endpoint.connectHostIsIp && endpoint.serverName != endpoint.connectHost) {
         "https://${endpoint.serverName}:$port$path (HTTP/3 → ${endpoint.connectHost})"
@@ -106,7 +121,7 @@ class Http3DnsResolver(
             }
         }
 
-        val request = engine.newUrlRequestBuilder(requestUrl(), callback, executor)
+        val request = acquireEngine().newUrlRequestBuilder(requestUrl(), callback, executor)
             .setHttpMethod("POST")
             .addHeader("Accept", DNS_MEDIA_TYPE)
             .addHeader("Content-Type", DNS_MEDIA_TYPE)
@@ -117,7 +132,28 @@ class Http3DnsResolver(
     }
 
     fun close() {
-        engine.shutdown()
+        // 仅关闭已创建的 engine；从未查询过的备用上游不会因懒加载而在此触发创建。
+        synchronized(engineLock) {
+            engine?.shutdown()
+            engine = null
+        }
+    }
+
+    /**
+     * 若 engine 已创建且空闲超过 [idleMillis]，关闭并重置，下次查询再重建。
+     * 由 CompositeResolver 在每次解析时顺带调用，无需独立定时器。
+     */
+    fun recycleIfIdle(idleMillis: Long) {
+        val last = lastUsedAtMs.get()
+        if (last == 0L) return
+        if (System.currentTimeMillis() - last < idleMillis) return
+        synchronized(engineLock) {
+            val current = engine ?: return
+            // 复检：可能在等锁期间刚被使用过。
+            if (System.currentTimeMillis() - lastUsedAtMs.get() < idleMillis) return
+            current.shutdown()
+            engine = null
+        }
     }
 
     private fun buildEngine(context: Context): CronetEngine {

@@ -45,6 +45,8 @@ class CompositeResolver(
     }
 
     suspend fun resolve(query: ByteArray): UpstreamResolution {
+        // 无定时器的空闲回收：借每次查询顺带检查，关闭长时间未用的 HTTP/3 engine。
+        recycleIdleHttp3()
         val failures = mutableListOf<Throwable>()
         for (group in resolverGroups) {
             try {
@@ -97,6 +99,11 @@ class CompositeResolver(
         httpClient.connectionPool.evictAll()
     }
 
+    private fun recycleIdleHttp3() {
+        if (http3Resolvers.isEmpty()) return
+        http3Resolvers.forEach { it.recycleIfIdle(HTTP3_IDLE_TIMEOUT_MS) }
+    }
+
     private fun createResolver(config: DnsServerConfig): DnsResolver {
         config.validate()
         return when (config.protocol) {
@@ -125,6 +132,8 @@ class CompositeResolver(
         }
     }
 }
+
+private const val HTTP3_IDLE_TIMEOUT_MS = 5 * 60 * 1000L
 
 class UpstreamFailure(
     val upstream: String,
