@@ -12,11 +12,16 @@ import com.lhstack.suxi.dns.dns.BlockRulesInitializer
 import com.lhstack.suxi.dns.dns.DnsServerStore
 import com.lhstack.suxi.dns.dns.DnsVpnService
 import com.lhstack.suxi.dns.dns.JsonListStore
+import com.lhstack.suxi.dns.dns.ManualDnsResolver
+import com.lhstack.suxi.dns.dns.ManualQueryResult
+import com.lhstack.suxi.dns.dns.ManualQueryType
+import com.lhstack.suxi.dns.dns.findManualTypeConflict
 import com.lhstack.suxi.dns.dns.VpnState
 import com.lhstack.suxi.dns.dns.VpnStatus
 import com.lhstack.suxi.dns.model.BlockMatchMode
 import com.lhstack.suxi.dns.model.DnsProtocol
 import com.lhstack.suxi.dns.model.DnsServerConfig
+import com.lhstack.suxi.dns.model.DnsServerGroup
 import com.lhstack.suxi.dns.model.DomainBlockRule
 import com.lhstack.suxi.dns.model.LocalDnsRecord
 import com.lhstack.suxi.dns.model.LocalRecordType
@@ -36,7 +41,21 @@ enum class AppScreen {
     DNS_SERVERS,
     LOCAL_RECORDS,
     BLOCK_RULES,
+    MANUAL_LOOKUP,
 }
+
+/**
+ * 手动解析页状态。
+ * [running] 期间禁用再次查询；[results] 为空且无错误表示尚未查询。
+ */
+data class ManualLookupState(
+    val input: String = "",
+    val selectedTypes: Set<ManualQueryType> = setOf(ManualQueryType.A),
+    val selectedGroupId: Long? = null,
+    val running: Boolean = false,
+    val results: List<ManualQueryResult> = emptyList(),
+    val error: String? = null,
+)
 
 class DnsConfigViewModel(application: Application) : AndroidViewModel(application) {
     private val serverStore = DnsServerStore(application)
@@ -51,8 +70,8 @@ class DnsConfigViewModel(application: Application) : AndroidViewModel(applicatio
         DomainBlockRule.serializer(),
     )
 
-    private val _servers = MutableStateFlow(serverStore.load())
-    val servers: StateFlow<List<DnsServerConfig>> = _servers.asStateFlow()
+    private val _groups = MutableStateFlow(serverStore.load())
+    val groups: StateFlow<List<DnsServerGroup>> = _groups.asStateFlow()
 
     private val _localRecords = MutableStateFlow(localStore.load())
     val localRecords: StateFlow<List<LocalDnsRecord>> = _localRecords.asStateFlow()
@@ -70,6 +89,10 @@ class DnsConfigViewModel(application: Application) : AndroidViewModel(applicatio
     private val _currentScreen = MutableStateFlow(AppScreen.HOME)
     val currentScreen: StateFlow<AppScreen> = _currentScreen.asStateFlow()
 
+    private val manualResolver = ManualDnsResolver(application)
+    private val _manualLookup = MutableStateFlow(ManualLookupState())
+    val manualLookup: StateFlow<ManualLookupState> = _manualLookup.asStateFlow()
+
     fun openHome() {
         _currentScreen.value = AppScreen.HOME
     }
@@ -86,30 +109,166 @@ class DnsConfigViewModel(application: Application) : AndroidViewModel(applicatio
         _currentScreen.value = AppScreen.BLOCK_RULES
     }
 
-    fun addServer() {
-        val id = nextId(_servers.value.map(DnsServerConfig::id))
-        replaceServers(
-            _servers.value + DnsServerConfig(
+    fun openManualLookup() {
+        _currentScreen.value = AppScreen.MANUAL_LOOKUP
+    }
+
+    fun updateManualInput(input: String) {
+        _manualLookup.value = _manualLookup.value.copy(input = input)
+    }
+
+    /** 切换某个解析类型的选中状态；切换后清除旧的类型冲突提示。 */
+    fun toggleManualType(type: ManualQueryType) {
+        val current = _manualLookup.value
+        val updated = current.selectedTypes.toMutableSet().apply {
+            if (!add(type)) remove(type)
+        }
+        _manualLookup.value = current.copy(
+            selectedTypes = updated,
+            error = findManualTypeConflict(updated),
+        )
+    }
+
+    fun selectManualGroup(groupId: Long) {
+        _manualLookup.value = _manualLookup.value.copy(selectedGroupId = groupId)
+    }
+
+    /**
+     * 执行手动解析：用选中的分组、选中的类型解析输入的域名或 IP。
+     * 输入、类型冲突、分组缺失等在此显式校验并回填错误，不静默吞掉。
+     */
+    fun runManualLookup() {
+        val state = _manualLookup.value
+        if (state.running) return
+        val input = state.input.trim()
+        if (input.isEmpty()) {
+            _manualLookup.value = state.copy(error = "请输入域名或 IP 地址")
+            return
+        }
+        val types = ManualQueryType.entries.filter { it in state.selectedTypes }
+        if (types.isEmpty()) {
+            _manualLookup.value = state.copy(error = "请至少选择一种解析类型")
+            return
+        }
+        findManualTypeConflict(types.toSet())?.let {
+            _manualLookup.value = state.copy(error = it)
+            return
+        }
+        val group = resolveManualGroup(state.selectedGroupId)
+        if (group == null) {
+            _manualLookup.value = state.copy(error = "请选择一个含有效上游的 DNS 分组")
+            return
+        }
+        _manualLookup.value = state.copy(running = true, error = null, results = emptyList())
+        viewModelScope.launch {
+            try {
+                val results = withContext(Dispatchers.IO) {
+                    manualResolver.resolve(input, types, group)
+                }
+                _manualLookup.value = _manualLookup.value.copy(running = false, results = results)
+            } catch (exception: Exception) {
+                _manualLookup.value = _manualLookup.value.copy(
+                    running = false,
+                    error = exception.message ?: "解析失败",
+                )
+            }
+        }
+    }
+
+    /** 选中的分组必须启用且含有效上游；未指定时取第一个可用分组。 */
+    private fun resolveManualGroup(groupId: Long?): DnsServerGroup? {
+        val usable = _groups.value.filter { it.enabled && it.enabledServers.isNotEmpty() }
+        if (usable.isEmpty()) return null
+        return groupId?.let { id -> usable.firstOrNull { it.id == id } } ?: usable.first()
+    }
+
+    fun addGroup() {
+        val id = nextId(_groups.value.map(DnsServerGroup::id))
+        replaceGroups(
+            _groups.value + DnsServerGroup(
                 id = id,
-                protocol = DnsProtocol.UDP,
-                host = "",
-                port = DnsProtocol.UDP.defaultPort,
+                name = "",
+                servers = emptyList(),
             ),
         )
     }
 
-    fun updateServer(config: DnsServerConfig) {
-        replaceServers(_servers.value.map { if (it.id == config.id) config else it })
+    fun updateGroupName(groupId: Long, name: String) {
+        replaceGroups(
+            _groups.value.map { if (it.id == groupId) it.copy(name = name) else it },
+        )
     }
 
-    fun removeServer(id: Long) {
-        replaceServers(_servers.value.filterNot { it.id == id })
+    fun removeGroup(groupId: Long) {
+        replaceGroups(_groups.value.filterNot { it.id == groupId })
     }
 
-    fun toggleServer(id: Long) {
-        replaceServers(
-            _servers.value.map {
-                if (it.id == id) it.copy(enabled = !it.enabled) else it
+    fun toggleGroup(groupId: Long) {
+        replaceGroups(
+            _groups.value.map {
+                if (it.id == groupId) it.copy(enabled = !it.enabled) else it
+            },
+        )
+    }
+
+    /** 拖拽重排分组：把 [fromIndex] 处的分组移动到 [toIndex]。 */
+    fun moveGroup(fromIndex: Int, toIndex: Int) {
+        val current = _groups.value
+        if (fromIndex !in current.indices || toIndex !in current.indices) return
+        if (fromIndex == toIndex) return
+        val reordered = current.toMutableList().apply {
+            add(toIndex, removeAt(fromIndex))
+        }
+        replaceGroups(reordered)
+    }
+
+    fun addServer(groupId: Long) {
+        val allIds = _groups.value.flatMap { group -> group.servers.map(DnsServerConfig::id) }
+        val id = nextId(allIds)
+        replaceGroups(
+            _groups.value.map { group ->
+                if (group.id != groupId) return@map group
+                group.copy(
+                    servers = group.servers + DnsServerConfig(
+                        id = id,
+                        protocol = DnsProtocol.UDP,
+                        host = "",
+                        port = DnsProtocol.UDP.defaultPort,
+                    ),
+                )
+            },
+        )
+    }
+
+    fun updateServer(groupId: Long, config: DnsServerConfig) {
+        replaceGroups(
+            _groups.value.map { group ->
+                if (group.id != groupId) return@map group
+                group.copy(
+                    servers = group.servers.map { if (it.id == config.id) config else it },
+                )
+            },
+        )
+    }
+
+    fun removeServer(groupId: Long, serverId: Long) {
+        replaceGroups(
+            _groups.value.map { group ->
+                if (group.id != groupId) return@map group
+                group.copy(servers = group.servers.filterNot { it.id == serverId })
+            },
+        )
+    }
+
+    fun toggleServer(groupId: Long, serverId: Long) {
+        replaceGroups(
+            _groups.value.map { group ->
+                if (group.id != groupId) return@map group
+                group.copy(
+                    servers = group.servers.map {
+                        if (it.id == serverId) it.copy(enabled = !it.enabled) else it
+                    },
+                )
             },
         )
     }
@@ -316,14 +475,14 @@ class DnsConfigViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun startVpn() {
         val context = getApplication<Application>()
-        val servers = validateServersForStart()
+        val groups = validateServersForStart()
         val locals = _localRecords.value.filter(LocalDnsRecord::enabled).onEach(LocalDnsRecord::validate)
         val blocks = _blockRules.value.filter(DomainBlockRule::enabled).onEach(DomainBlockRule::validate)
         val intent = Intent(context, DnsVpnService::class.java)
             .setAction(DnsVpnService.ACTION_START)
             .putExtra(
                 DnsVpnService.EXTRA_CONFIGS,
-                Json.encodeToString(ListSerializer(DnsServerConfig.serializer()), servers),
+                Json.encodeToString(ListSerializer(DnsServerGroup.serializer()), groups),
             )
             .putExtra(
                 DnsVpnService.EXTRA_LOCAL_RECORDS,
@@ -355,9 +514,9 @@ class DnsConfigViewModel(application: Application) : AndroidViewModel(applicatio
         return status.state == VpnState.RUNNING || status.state == VpnState.STARTING
     }
 
-    private fun replaceServers(servers: List<DnsServerConfig>) {
-        _servers.value = servers
-        serverStore.save(servers)
+    private fun replaceGroups(groups: List<DnsServerGroup>) {
+        _groups.value = groups
+        serverStore.save(groups)
     }
 
     private fun replaceLocalRecords(records: List<LocalDnsRecord>) {
@@ -376,11 +535,11 @@ class DnsConfigViewModel(application: Application) : AndroidViewModel(applicatio
         _blockRules.value.filter(DomainBlockRule::enabled).forEach(DomainBlockRule::validate)
     }
 
-    private fun validateServersForStart(): List<DnsServerConfig> {
-        val all = _servers.value
-        val enabledServers = all.filter(DnsServerConfig::enabled)
-        require(enabledServers.isNotEmpty()) { "请至少启用一个 DNS 服务器" }
-        enabledServers.forEach(DnsServerConfig::validate)
+    private fun validateServersForStart(): List<DnsServerGroup> {
+        val all = _groups.value
+        val activeGroups = all.filter { it.enabled && it.enabledServers.isNotEmpty() }
+        require(activeGroups.isNotEmpty()) { "请至少启用一个含有效上游的 DNS 分组" }
+        all.filter(DnsServerGroup::enabled).forEach(DnsServerGroup::validate)
         return all
     }
 
